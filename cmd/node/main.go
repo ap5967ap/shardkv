@@ -25,16 +25,20 @@ import (
 
 var (
 	nodeID    = flag.String("node-id", "", "Unique node ID (required)")
+	shardID   = flag.String("shard-id", "", "Shard ID for this node (e.g., A, B, C)")
 	raftAddr  = flag.String("raft-addr", "", "Raft address (e.g., 127.0.0.1:7000) (required)")
 	httpAddr  = flag.String("http-addr", "", "HTTP address (e.g., 127.0.0.1:8000) (required)")
 	dataDir   = flag.String("data-dir", "", "Data directory for Raft storage (required)")
 	bootstrap = flag.Bool("bootstrap", false, "Bootstrap the cluster (only for first node)")
-	peers     = flag.String("peers", "", "Comma-separated list of peer addresses (e.g., 127.0.0.1:7000,127.0.0.1:7001)")
-	peerIDs   = flag.String("peer-ids", "", "Comma-separated list of peer IDs corresponding to peers (e.g., node1,node2,node3)")
+	peers     = flag.String("peers", "", "Comma-separated list of peer Raft addresses (e.g., 127.0.0.1:7000,127.0.0.1:7100)")
+	peerIDs   = flag.String("peer-ids", "", "Comma-separated list of peer IDs corresponding to peers (e.g., A1,A2,A3)")
+	peersHTTP = flag.String("peers-http", "", "Comma-separated list of peer HTTP addresses, same order as --peers (e.g., 127.0.0.1:8000,127.0.0.1:8001)")
 )
+
 
 type Node struct {
 	nodeID        string
+	shardID       string
 	raftAddr      string
 	httpAddr      string
 	dataDir       string
@@ -47,13 +51,33 @@ type Node struct {
 	logStore      raft.LogStore
 	stableStore   raft.StableStore
 	snapshotStore raft.SnapshotStore
+	// raftToHTTP maps each peer's Raft address to its HTTP address.
+	// Populated at bootstrap time so followers can expose the leader's HTTP
+	// address to the router even when they are not the leader.
+	raftToHTTP map[string]string
 }
 
 func main() {
 	flag.Parse()
 
-	if *nodeID == "" || *raftAddr == "" || *httpAddr == "" || *dataDir == "" {
-		log.Fatal("node-id, raft-addr, http-addr, and data-dir are required")
+	if *nodeID == "" || *shardID == "" || *raftAddr == "" || *httpAddr == "" || *dataDir == "" {
+		log.Fatal("node-id, shard-id, raft-addr, http-addr, and data-dir are required")
+	}
+
+	// Build the Raft-addr → HTTP-addr mapping from --peers / --peers-http.
+	// This lets any node (leader or follower) resolve the leader's HTTP address
+	// without polling, because n.raft.Leader() always returns the Raft address.
+	raftToHTTPMap := make(map[string]string)
+	if *peers != "" && *peersHTTP != "" {
+		raftAddrs := strings.Split(*peers, ",")
+		httpAddrs := strings.Split(*peersHTTP, ",")
+		if len(raftAddrs) != len(httpAddrs) {
+			log.Fatalf("--peers (%d entries) and --peers-http (%d entries) must have the same number of entries",
+				len(raftAddrs), len(httpAddrs))
+		}
+		for i, ra := range raftAddrs {
+			raftToHTTPMap[strings.TrimSpace(ra)] = strings.TrimSpace(httpAddrs[i])
+		}
 	}
 
 	// Create data directory if it doesn't exist
@@ -61,12 +85,12 @@ func main() {
 		log.Fatalf("Failed to create data directory: %v", err)
 	}
 
-	node, err := NewNode(*nodeID, *raftAddr, *httpAddr, *dataDir)
+	node, err := NewNode(*nodeID, *shardID, *raftAddr, *httpAddr, *dataDir, raftToHTTPMap)
 	if err != nil {
 		log.Fatalf("Failed to create node: %v", err)
 	}
 	defer node.Shutdown()
-
+	
 	// Bootstrap if requested
 	if *bootstrap {
 		if *peers != "" {
@@ -81,14 +105,27 @@ func main() {
 			}
 		}
 	} else {
-		// Not bootstrapping, but check if we need to join existing cluster
+		// Non-bootstrap nodes do not need to "join" explicitly.
+		// Known limitation: this cluster topology requires all nodes to be
+		// started together in a single launch. Node 1 (--bootstrap) calls
+		// BootstrapCluster with the full peer list (A1+A2+A3), which writes
+		// the initial Raft configuration for the whole group before nodes 2
+		// and 3 start. Nodes 2 and 3 simply open their empty stores and wait;
+		// they receive the configuration from node 1 via the first AppendEntries
+		// RPC once connectivity is established.
+		//
+		// Consequence: you cannot add a node to a running cluster dynamically
+		// via this path — raft.AddVoter() would be needed for that (Phase 5+).
+		// The --peers flag on non-bootstrap nodes is currently unused but kept
+		// for future use.
 		if *peers != "" {
-			log.Printf("Node %s joining existing cluster with peers: %s", *nodeID, *peers)
-			// For now, just log - actual joining logic would be implemented here
+			log.Printf("Node %s: peer list provided but this node is not bootstrapping. "+
+				"Peers are registered by the bootstrap node (node 1). "+
+				"Dynamic join via raft.AddVoter() is not yet implemented.", *nodeID)
 		}
 	}
 
-	log.Printf("Node %s started successfully", *nodeID)
+	log.Printf("Node %s started successfully (shard: %s)", *nodeID, *shardID)
 	log.Printf("Raft address: %s", *raftAddr)
 	log.Printf("HTTP address: %s", *httpAddr)
 
@@ -105,7 +142,8 @@ func main() {
 	log.Println("Shutting down node...")
 }
 
-func NewNode(nodeID, raftAddr, httpAddr, dataDir string) (*Node, error) {
+
+func NewNode(nodeID, shardID, raftAddr, httpAddr, dataDir string, raftToHTTP map[string]string) (*Node, error) {
 	// Create storage
 	storagePath := filepath.Join(dataDir, "kv.db")
 	store, err := storage.New(storagePath)
@@ -158,8 +196,15 @@ func NewNode(nodeID, raftAddr, httpAddr, dataDir string) (*Node, error) {
 		return nil, fmt.Errorf("failed to create raft: %w", err)
 	}
 
+	// Always include this node's own raft→http mapping.
+	if raftToHTTP == nil {
+		raftToHTTP = make(map[string]string)
+	}
+	raftToHTTP[raftAddr] = httpAddr
+
 	return &Node{
 		nodeID:        nodeID,
+		shardID:       shardID,
 		raftAddr:      raftAddr,
 		httpAddr:      httpAddr,
 		dataDir:       dataDir,
@@ -170,8 +215,10 @@ func NewNode(nodeID, raftAddr, httpAddr, dataDir string) (*Node, error) {
 		logStore:      logStore,
 		stableStore:   stableStore,
 		snapshotStore: snapshotStore,
+		raftToHTTP:    raftToHTTP,
 	}, nil
 }
+
 
 // StartHTTPServer starts the HTTP API server
 func (n *Node) StartHTTPServer() error {
@@ -345,6 +392,25 @@ func (n *Node) LeaderAddr() string {
 	return string(n.raft.Leader())
 }
 
+// LeaderHTTPAddr returns the HTTP address of the current Raft leader.
+// Works on both the leader itself and followers — the leader's Raft address
+// is always known via n.raft.Leader(), and we translate it to HTTP via the
+// raftToHTTP map populated at bootstrap time.
+// Returns "" only if no leader has been elected yet.
+func (n *Node) LeaderHTTPAddr() string {
+	leaderRaftAddr := string(n.raft.Leader())
+	if leaderRaftAddr == "" {
+		return ""
+	}
+	if httpAddr, ok := n.raftToHTTP[leaderRaftAddr]; ok {
+		return httpAddr
+	}
+	// Fallback: if we somehow don't have the mapping (e.g., older peer added
+	// dynamically), return empty string so the router falls back to polling.
+	return ""
+}
+
+
 func (n *Node) Get(key string) (string, uint64, error) {
 	return n.storage.Get(key)
 }
@@ -352,4 +418,9 @@ func (n *Node) Get(key string) (string, uint64, error) {
 // GetRaft returns the Raft instance (for testing)
 func (n *Node) GetRaft() *raft.Raft {
 	return n.raft
+}
+
+// GetShardID returns the shard ID for this node
+func (n *Node) GetShardID() string {
+	return n.shardID
 }

@@ -12,12 +12,13 @@ import (
 func TestNode_NewNode(t *testing.T) {
 	dataDir := t.TempDir()
 
-	node, err := NewNode("test-node", "127.0.0.1:7001", "127.0.0.1:8001", dataDir)
+	node, err := NewNode("test-node", "A", "127.0.0.1:7001", "127.0.0.1:8001", dataDir, nil)
 	require.NoError(t, err)
 	require.NotNil(t, node)
 	defer node.Shutdown()
 
 	assert.Equal(t, "test-node", node.nodeID)
+	assert.Equal(t, "A", node.shardID)
 	assert.Equal(t, "127.0.0.1:7001", node.raftAddr)
 	assert.Equal(t, "127.0.0.1:8001", node.httpAddr)
 	assert.NotNil(t, node.raft)
@@ -28,7 +29,7 @@ func TestNode_NewNode(t *testing.T) {
 func TestSingleNodeCluster(t *testing.T) {
 	dataDir := t.TempDir()
 
-	node, err := NewNode("node1", "127.0.0.1:7000", "127.0.0.1:8000", dataDir)
+	node, err := NewNode("node1", "A", "127.0.0.1:7000", "127.0.0.1:8000", dataDir, nil)
 	require.NoError(t, err)
 	defer node.Shutdown()
 
@@ -37,7 +38,7 @@ func TestSingleNodeCluster(t *testing.T) {
 	require.NoError(t, err)
 
 	// Wait for leader election
-	time.Sleep(2 * time.Second)
+	time.Sleep(3 * time.Second)
 
 	// Verify node is leader
 	assert.True(t, node.IsLeader(), "Node should be leader after bootstrap")
@@ -67,7 +68,7 @@ func TestNodeRestart(t *testing.T) {
 	dataDir := t.TempDir()
 
 	// Step 1: Create and bootstrap a node
-	node1, err := NewNode("node1", "127.0.0.1:7000", "127.0.0.1:8000", dataDir)
+	node1, err := NewNode("node1", "A", "127.0.0.1:7000", "127.0.0.1:8000", dataDir, nil)
 	require.NoError(t, err)
 	defer node1.Shutdown()
 
@@ -75,7 +76,7 @@ func TestNodeRestart(t *testing.T) {
 	require.NoError(t, err)
 
 	// Wait for leader election
-	time.Sleep(2 * time.Second)
+	time.Sleep(3 * time.Second)
 
 	// Write data
 	op := raftfsm.Operation{
@@ -98,7 +99,7 @@ func TestNodeRestart(t *testing.T) {
 	node1.Shutdown()
 
 	// Step 3: Create a new node from the same data directory (simulates restart)
-	node2, err := NewNode("node1", "127.0.0.1:7000", "127.0.0.1:8000", dataDir)
+	node2, err := NewNode("node1", "A", "127.0.0.1:7000", "127.0.0.1:8000", dataDir, nil)
 	require.NoError(t, err)
 	defer node2.Shutdown()
 
@@ -107,7 +108,7 @@ func TestNodeRestart(t *testing.T) {
 	require.NoError(t, err, "BootstrapClusterIfNew should succeed without bootstrapping")
 
 	// Wait for leader election
-	time.Sleep(2 * time.Second)
+	time.Sleep(3 * time.Second)
 
 	// Step 5: Verify the original value is still present
 	value, _, err = node2.Get("test-key")

@@ -5,3 +5,9 @@ KILO_SYSTEM_PROMPT.md
 .devin*
 .agents*
 SKILL.md
+
+# Generated binaries
+node
+router
+cmd/node/node
+cmd/router/router

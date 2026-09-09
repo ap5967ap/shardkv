@@ -1,0 +1,1 @@
+{"name":"Local: a","url":"/home/ap/resume/kv/a.cpp","tests":[{"id":1788993094844,"input":"1\n2\n5 4 3 2","output":""}],"interactive":false,"memoryLimit":1024,"timeLimit":3000,"srcPath":"/home/ap/resume/kv/a.cpp","group":"local","local":true}
