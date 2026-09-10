@@ -169,14 +169,15 @@ for shard_idx in $(seq 0 $((SHARD_COUNT - 1))); do
         # Create data directory
         mkdir -p "$DATA_DIR"
 
-        # Determine if this is the bootstrap node (first node in shard)
+        # Every node in a shard should know the full peer roster so it can join or
+        # rejoin the cluster reliably. The bootstrap node additionally initializes the
+        # Raft configuration for the group.
         BOOTSTRAP_FLAG=""
-        PEERS_FLAG=""
-        PEER_IDS_FLAG=""
+        PEERS_FLAG="--peers $PEERS"
+        PEER_IDS_FLAG="--peer-ids $PEER_IDS"
+        PEERS_HTTP_FLAG="--peers-http $PEERS_HTTP"
         if [ $node_idx -eq 1 ]; then
             BOOTSTRAP_FLAG="--bootstrap"
-            PEERS_FLAG="--peers $PEERS"
-            PEER_IDS_FLAG="--peer-ids $PEER_IDS"
             echo -e "${GREEN}Bootstrapping shard $SHARD_ID with node $NODE_ID${NC}"
         else
             echo -e "${YELLOW}Starting node $NODE_ID (shard $SHARD_ID)${NC}"
@@ -202,6 +203,7 @@ for shard_idx in $(seq 0 $((SHARD_COUNT - 1))); do
             $BOOTSTRAP_FLAG \
             $PEERS_FLAG \
             $PEER_IDS_FLAG \
+            $PEERS_HTTP_FLAG \
             > "${DATA_DIR}/node.log" 2>&1 &
 
         NODE_PID=$!

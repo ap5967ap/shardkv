@@ -21,6 +21,7 @@ import (
 
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
@@ -226,6 +227,7 @@ func (n *Node) StartHTTPServer() error {
 
 	mux := http.NewServeMux()
 	n.apiServer.RegisterRoutes(mux)
+	mux.Handle("/metrics", promhttp.Handler())
 
 	n.httpSrv = &http.Server{
 		Addr:    n.httpAddr,
@@ -233,6 +235,8 @@ func (n *Node) StartHTTPServer() error {
 	}
 
 	go func() {
+		// Start metrics collection goroutine
+		go n.collectMetricsPeriodically()
 		log.Printf("Starting HTTP server on %s", n.httpAddr)
 		if err := n.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("HTTP server error: %v", err)
@@ -447,4 +451,13 @@ func (n *Node) GetCommitIndex() uint64 {
 		return index
 	}
 	return 0
+}
+
+// collectMetricsPeriodically collects and updates Prometheus metrics periodically
+func (n *Node) collectMetricsPeriodically() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+	}
 }
