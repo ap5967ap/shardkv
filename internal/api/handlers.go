@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
 	"shardkv/internal/raftfsm"
 
@@ -19,6 +20,8 @@ type Node interface {
 	LeaderHTTPAddr() string
 	GetShardID() string
 	GetRaft() *raft.Raft
+	GetAppliedIndex() uint64
+	GetCommitIndex() uint64
 }
 
 // Server wraps the HTTP server and node reference
@@ -121,10 +124,49 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, key string) {
 }
 
 // handleGet handles GET requests
-// For Phase 2, we do simple reads from local FSM
-// Strong linearizable reads (VerifyLeader + Barrier) are Phase 3
+// Supports consistency parameter: ?consistency=strong|eventual (default: strong)
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, key string) {
-	// Simple read from local FSM for Phase 2
+	// Parse consistency parameter (default: strong)
+	consistency := r.URL.Query().Get("consistency")
+	if consistency == "" {
+		consistency = "strong"
+	}
+
+	switch consistency {
+	case "strong":
+		s.handleStrongGet(w, r, key)
+	case "eventual":
+		s.handleEventualGet(w, r, key)
+	default:
+		http.Error(w, "invalid consistency parameter, must be 'strong' or 'eventual'", http.StatusBadRequest)
+	}
+}
+
+// handleStrongGet implements STRONG reads with VerifyLeader() + Barrier()
+// This is the correct linearizable read protocol per design.md §6.2
+func (s *Server) handleStrongGet(w http.ResponseWriter, r *http.Request, key string) {
+	raftNode := s.node.GetRaft()
+
+	// Step 1: VerifyLeader() - confirms this node is still the leader
+	// This catches the partition scenario where a node believes it's leader but isn't
+	if err := raftNode.VerifyLeader().Error(); err != nil {
+		// Not actually leader - return 503 so router can retry against new leader
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "not leader",
+		})
+		return
+	}
+
+	// Step 2: Barrier() - ensures all committed entries are applied to local FSM
+	// This closes the gap between "committed" and "applied locally"
+	if err := raftNode.Barrier(5 * time.Second).Error(); err != nil {
+		http.Error(w, fmt.Sprintf("barrier failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Step 3: Now safe to read from local FSM - this is linearizable
 	value, appliedIndex, err := s.node.Get(key)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("key not found: %v", err), http.StatusNotFound)
@@ -135,8 +177,43 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, key string) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"value":         value,
+		"consistency":   "strong",
 		"applied_index": appliedIndex,
 	})
+}
+
+// handleEventualGet implements EVENTUAL reads from local FSM
+// No VerifyLeader/Barrier - accepts potential staleness
+func (s *Server) handleEventualGet(w http.ResponseWriter, r *http.Request, key string) {
+	// Read from local FSM without any consistency checks
+	value, appliedIndex, err := s.node.Get(key)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("key not found: %v", err), http.StatusNotFound)
+		return
+	}
+
+	lagIndex := s.calculateLagIndex()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"value":         value,
+		"consistency":   "eventual",
+		"applied_index": appliedIndex,
+		"lag_index":     lagIndex,
+	})
+}
+
+// calculateLagIndex reports the actual local replica lag in committed entries.
+// This is the truthful, observable metric. We do not fabricate a wall-clock
+// lag_ms from an index delta because no real timings are captured.
+func (s *Server) calculateLagIndex() uint64 {
+	appliedIndex := s.node.GetAppliedIndex()
+	commitIndex := s.node.GetCommitIndex()
+	if commitIndex <= appliedIndex {
+		return 0
+	}
+	return commitIndex - appliedIndex
 }
 
 // handleDelete handles DELETE requests

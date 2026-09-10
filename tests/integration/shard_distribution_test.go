@@ -35,6 +35,7 @@ func TestShardDistribution(t *testing.T) {
 		value := fmt.Sprintf("value%d", i)
 		resp, err := httpPut("http://127.0.0.1:9000/kv/"+key, value)
 		require.NoError(t, err, "Failed to PUT key %s", key)
+		resp.Body.Close()
 		assert.Equal(t, http.StatusOK, resp.StatusCode, "PUT should succeed for key %s", key)
 	}
 
@@ -45,6 +46,7 @@ func TestShardDistribution(t *testing.T) {
 	for _, key := range testKeys {
 		resp, err := httpGet("http://127.0.0.1:9000/kv/" + key)
 		require.NoError(t, err, "Failed to GET key %s", key)
+		resp.Body.Close()
 		assert.Equal(t, http.StatusOK, resp.StatusCode, "GET should succeed for key %s", key)
 	}
 
@@ -52,6 +54,7 @@ func TestShardDistribution(t *testing.T) {
 	shardsResp, err := httpGet("http://127.0.0.1:9000/cluster/shards")
 	require.NoError(t, err, "Failed to get shard information")
 	require.Equal(t, http.StatusOK, shardsResp.StatusCode)
+	defer shardsResp.Body.Close()
 
 	var shardsData struct {
 		Shards []struct {
@@ -96,12 +99,13 @@ func TestShardDistribution(t *testing.T) {
 		healthResp, err := httpGet(fmt.Sprintf("http://%s/cluster/health", leaderAddr))
 		require.NoError(t, err, "Leader %s for shard %s should be responding", leaderAddr, shardID)
 		require.Equal(t, http.StatusOK, healthResp.StatusCode, "Leader %s for shard %s should return healthy", leaderAddr, shardID)
-		healthResp.Body.Close()
+		defer healthResp.Body.Close()
 
 		for _, key := range keys {
 			// Verify the key exists on the shard's leader directly
 			resp, err := httpGet(fmt.Sprintf("http://%s/kv/%s", leaderAddr, key))
 			require.NoError(t, err, "Failed to GET key %s from shard %s leader at %s", key, shardID, leaderAddr)
+			resp.Body.Close()
 			assert.Equal(t, http.StatusOK, resp.StatusCode, "Key %s should exist on shard %s", key, shardID)
 		}
 	}
@@ -149,7 +153,6 @@ func isClusterRunning() bool {
 	}
 	return true
 }
-
 
 func httpPut(url, value string) (*http.Response, error) {
 	body := fmt.Sprintf(`{"value":"%s"}`, value)

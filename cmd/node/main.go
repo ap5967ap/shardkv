@@ -424,3 +424,27 @@ func (n *Node) GetRaft() *raft.Raft {
 func (n *Node) GetShardID() string {
 	return n.shardID
 }
+
+// GetAppliedIndex returns the highest index applied to this node's FSM
+func (n *Node) GetAppliedIndex() uint64 {
+	// Get the last applied index from Raft stats
+	stats := n.raft.Stats()
+	if appliedIndexStr, ok := stats["applied_index"]; ok {
+		var index uint64
+		fmt.Sscanf(appliedIndexStr, "%d", &index)
+		return index
+	}
+	return 0
+}
+
+// GetCommitIndex returns the commit index known to this node
+func (n *Node) GetCommitIndex() uint64 {
+	// Get the commit index from Raft stats
+	stats := n.raft.Stats()
+	if commitIndexStr, ok := stats["commit_index"]; ok {
+		var index uint64
+		fmt.Sscanf(commitIndexStr, "%d", &index)
+		return index
+	}
+	return 0
+}
