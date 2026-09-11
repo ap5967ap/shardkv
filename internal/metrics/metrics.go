@@ -10,20 +10,22 @@ import (
 
 var (
 	// Raft metrics
-	RaftTerm = promauto.NewGauge(prometheus.GaugeOpts{
+	// Use labeled GaugeVecs for term/commit/applied so multiple nodes/shards
+	// do not overwrite the same metric series.
+	RaftTerm = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "raft_term",
 		Help: "Current Raft term",
-	})
+	}, []string{"node_id", "shard_id"})
 
-	RaftCommitIndex = promauto.NewGauge(prometheus.GaugeOpts{
+	RaftCommitIndex = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "raft_commit_index",
 		Help: "Current Raft commit index",
-	})
+	}, []string{"node_id", "shard_id"})
 
-	RaftAppliedIndex = promauto.NewGauge(prometheus.GaugeOpts{
+	RaftAppliedIndex = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "raft_applied_index",
 		Help: "Current Raft applied index",
-	})
+	}, []string{"node_id", "shard_id"})
 
 	RaftState = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "raft_state",
@@ -91,7 +93,7 @@ func (m *MetricsCollector) Collect() {
 	if termStr, ok := stats["term"]; ok {
 		var term uint64
 		fmt.Sscanf(termStr, "%d", &term)
-		RaftTerm.Set(float64(term))
+		RaftTerm.WithLabelValues(m.nodeID, m.shardID).Set(float64(term))
 
 		// Track leader changes
 		if term > m.lastTerm {
@@ -104,14 +106,14 @@ func (m *MetricsCollector) Collect() {
 	if commitIndexStr, ok := stats["commit_index"]; ok {
 		var commitIndex uint64
 		fmt.Sscanf(commitIndexStr, "%d", &commitIndex)
-		RaftCommitIndex.Set(float64(commitIndex))
+		RaftCommitIndex.WithLabelValues(m.nodeID, m.shardID).Set(float64(commitIndex))
 	}
 
 	// Update applied index
 	if appliedIndexStr, ok := stats["applied_index"]; ok {
 		var appliedIndex uint64
 		fmt.Sscanf(appliedIndexStr, "%d", &appliedIndex)
-		RaftAppliedIndex.Set(float64(appliedIndex))
+		RaftAppliedIndex.WithLabelValues(m.nodeID, m.shardID).Set(float64(appliedIndex))
 	}
 
 	// Update state

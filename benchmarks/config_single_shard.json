@@ -1,0 +1,13 @@
+{
+  "router_url": "http://127.0.0.1:9000",
+  "duration_seconds": 30,
+  "request_rate": 100,
+  "num_workers": 10,
+  "strong_read_ratio": 0.5,
+  "write_ratio": 0.3,
+  "key_distribution": "uniform",
+  "key_count": 1000,
+  "hot_key_ratio": 0.9,
+  "output_file": "results_single_shard.jsonl",
+  "metrics_interval_seconds": 5
+}

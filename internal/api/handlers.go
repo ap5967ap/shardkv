@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"shardkv/internal/metrics"
 	"shardkv/internal/raftfsm"
 
 	"github.com/hashicorp/raft"
@@ -18,6 +19,7 @@ type Node interface {
 	IsLeader() bool
 	LeaderAddr() string
 	LeaderHTTPAddr() string
+	GetNodeID() string
 	GetShardID() string
 	GetRaft() *raft.Raft
 	GetAppliedIndex() uint64
@@ -88,6 +90,11 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
 
 // handlePut handles PUT requests
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, key string) {
+	start := time.Now()
+	defer func() {
+		metrics.RecordWrite(s.node.GetNodeID(), s.node.GetShardID(), "PUT")
+		metrics.RecordLatency(s.node.GetNodeID(), s.node.GetShardID(), "PUT", "strong", float64(time.Since(start).Nanoseconds())/1000000.0)
+	}()
 	var req struct {
 		Value string `json:"value"`
 	}
@@ -156,6 +163,11 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, key string) {
 // handleStrongGet implements STRONG reads with VerifyLeader() + Barrier()
 // This is the correct linearizable read protocol per design.md §6.2
 func (s *Server) handleStrongGet(w http.ResponseWriter, r *http.Request, key string) {
+	start := time.Now()
+	defer func() {
+		metrics.RecordRead(s.node.GetNodeID(), s.node.GetShardID(), "strong")
+		metrics.RecordLatency(s.node.GetNodeID(), s.node.GetShardID(), "GET", "strong", float64(time.Since(start).Nanoseconds())/1000000.0)
+	}()
 	raftNode := s.node.GetRaft()
 
 	// Step 1: VerifyLeader() - confirms this node is still the leader
@@ -196,6 +208,11 @@ func (s *Server) handleStrongGet(w http.ResponseWriter, r *http.Request, key str
 // handleEventualGet implements EVENTUAL reads from local FSM
 // No VerifyLeader/Barrier - accepts potential staleness
 func (s *Server) handleEventualGet(w http.ResponseWriter, r *http.Request, key string) {
+	start := time.Now()
+	defer func() {
+		metrics.RecordRead(s.node.GetNodeID(), s.node.GetShardID(), "eventual")
+		metrics.RecordLatency(s.node.GetNodeID(), s.node.GetShardID(), "GET", "eventual", float64(time.Since(start).Nanoseconds())/1000000.0)
+	}()
 	// Read from local FSM without any consistency checks
 	value, appliedIndex, err := s.node.Get(key)
 	if err != nil {
@@ -229,6 +246,11 @@ func (s *Server) calculateLagIndex() uint64 {
 
 // handleDelete handles DELETE requests
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, key string) {
+	start := time.Now()
+	defer func() {
+		metrics.RecordWrite(s.node.GetNodeID(), s.node.GetShardID(), "DELETE")
+		metrics.RecordLatency(s.node.GetNodeID(), s.node.GetShardID(), "DELETE", "strong", float64(time.Since(start).Nanoseconds())/1000000.0)
+	}()
 	op := raftfsm.Operation{
 		Op:  "DELETE",
 		Key: key,

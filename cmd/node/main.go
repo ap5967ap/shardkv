@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"shardkv/internal/api"
+	"shardkv/internal/metrics"
 	"shardkv/internal/raftfsm"
 	"shardkv/internal/storage"
 
@@ -509,6 +510,11 @@ func (n *Node) GetRaft() *raft.Raft {
 	return n.raft
 }
 
+// GetNodeID returns the node ID
+func (n *Node) GetNodeID() string {
+	return n.nodeID
+}
+
 // GetShardID returns the shard ID for this node
 func (n *Node) GetShardID() string {
 	return n.shardID
@@ -540,10 +546,12 @@ func (n *Node) GetCommitIndex() uint64 {
 
 // collectMetricsPeriodically collects and updates Prometheus metrics periodically
 func (n *Node) collectMetricsPeriodically() {
+	collector := metrics.NewMetricsCollector(n.raft, n.nodeID, n.shardID)
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
+		collector.Collect()
 	}
 }
 

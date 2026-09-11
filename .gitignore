@@ -11,3 +11,4 @@ node
 router
 cmd/node/node
 cmd/router/router
+benchmarks/metrics_output
