@@ -58,8 +58,9 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
 		// Phase 3 will add the ?consistency=strong|eventual parameter and route
 		// strong reads through VerifyLeader+Barrier; eventual reads stay here.
 		s.handleGet(w, r, key)
-	case http.MethodPut:
-		// Writes must go to the leader — only the leader can call raft.Apply().
+	case http.MethodPut, http.MethodPost:
+		// Compatibility: the project and older scripts sometimes issue a POST
+		// for writes, but the underlying semantics are still leader-only Raft writes.
 		if !s.node.IsLeader() {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -109,6 +110,16 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, key string) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			json.NewEncoder(w).Encode(map[string]string{
 				"error": "leadership lost during operation",
+			})
+			return
+		}
+		// Check if this is a frozen key error - return 503 with retry-after
+		if err.Error() == "key is frozen for migration" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "5")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "key is frozen for migration",
 			})
 			return
 		}
@@ -230,6 +241,16 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, key string
 			w.WriteHeader(http.StatusServiceUnavailable)
 			json.NewEncoder(w).Encode(map[string]string{
 				"error": "leadership lost during operation",
+			})
+			return
+		}
+		// Check if this is a frozen key error - return 503 with retry-after
+		if err.Error() == "key is frozen for migration" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "5")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "key is frozen for migration",
 			})
 			return
 		}

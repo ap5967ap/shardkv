@@ -89,6 +89,55 @@ func TestFSM_Apply_DELETE(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestFSM_Apply_RejectsPutWhenKeyInFrozenRange(t *testing.T) {
+	store := setupTestStorage(t)
+	defer store.Close()
+
+	fsm := NewKVFSM(store)
+
+	err := store.SetFrozenRange(struct {
+		Start string `json:"start"`
+		End   string `json:"end"`
+	}{Start: "alpha", End: "zeta"})
+	require.NoError(t, err)
+
+	op := Operation{Op: "PUT", Key: "beta", Value: "should-not-write"}
+	data, err := json.Marshal(op)
+	require.NoError(t, err)
+
+	result := fsm.Apply(&raft.Log{Index: 1, Data: data})
+	applyResult, ok := result.(*ApplyResult)
+	require.True(t, ok)
+	require.Error(t, applyResult.Error)
+	assert.Contains(t, applyResult.Error.Error(), "frozen")
+
+	_, _, err = store.Get("beta")
+	assert.Error(t, err)
+}
+
+func TestFSM_Apply_RejectsPutWhenRangeIsUnbounded(t *testing.T) {
+	store := setupTestStorage(t)
+	defer store.Close()
+
+	fsm := NewKVFSM(store)
+
+	err := store.SetFrozenRange(struct {
+		Start string `json:"start"`
+		End   string `json:"end"`
+	}{})
+	require.NoError(t, err)
+
+	op := Operation{Op: "PUT", Key: "any-key", Value: "not-allowed"}
+	data, err := json.Marshal(op)
+	require.NoError(t, err)
+
+	result := fsm.Apply(&raft.Log{Index: 1, Data: data})
+	applyResult, ok := result.(*ApplyResult)
+	require.True(t, ok)
+	require.Error(t, applyResult.Error)
+	assert.Contains(t, applyResult.Error.Error(), "frozen")
+}
+
 func TestFSM_Apply_UnknownOperation(t *testing.T) {
 	store := setupTestStorage(t)
 	defer store.Close()

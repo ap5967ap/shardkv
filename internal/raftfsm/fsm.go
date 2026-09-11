@@ -13,9 +13,11 @@ import (
 
 // Operation represents a log entry operation
 type Operation struct {
-	Op    string `json:"op"` // "PUT" or "DELETE"
-	Key   string `json:"key"`
-	Value string `json:"value,omitempty"`
+	Op        string `json:"op"` // "PUT", "DELETE", "FREEZE", or "UNFREEZE"
+	Key       string `json:"key,omitempty"`
+	Value     string `json:"value,omitempty"`
+	RangeStart string `json:"range_start,omitempty"`
+	RangeEnd   string `json:"range_end,omitempty"`
 }
 
 // ApplyResult is returned by Apply() to indicate success/failure
@@ -35,11 +37,43 @@ func NewKVFSM(store *storage.Storage) *KVFSM {
 	}
 }
 
+func keyInFrozenRange(key string, frozenRange struct {
+	Start string `json:"start"`
+	End   string `json:"end"`
+}) bool {
+	if frozenRange.Start == "" && frozenRange.End == "" {
+		return true
+	}
+	if frozenRange.Start != "" && key < frozenRange.Start {
+		return false
+	}
+	if frozenRange.End != "" && key > frozenRange.End {
+		return false
+	}
+	return true
+}
+
 // Apply applies a Raft log entry to the FSM
 func (f *KVFSM) Apply(log *raft.Log) interface{} {
 	var op Operation
 	if err := json.Unmarshal(log.Data, &op); err != nil {
 		return &ApplyResult{Error: fmt.Errorf("failed to unmarshal operation: %w", err)}
+	}
+
+	if op.Op == "PUT" || op.Op == "DELETE" {
+		frozenRange, found, err := f.storage.GetFrozenRange()
+		if err != nil {
+			return &ApplyResult{Error: fmt.Errorf("failed to read frozen range: %w", err)}
+		}
+		if found && keyInFrozenRange(op.Key, struct {
+			Start string `json:"start"`
+			End   string `json:"end"`
+		}{
+			Start: frozenRange.Start,
+			End:   frozenRange.End,
+		}) {
+			return &ApplyResult{Error: fmt.Errorf("key is frozen for migration")}
+		}
 	}
 
 	switch op.Op {
@@ -50,6 +84,20 @@ func (f *KVFSM) Apply(log *raft.Log) interface{} {
 	case "DELETE":
 		if err := f.storage.Delete(op.Key, log.Index); err != nil {
 			return &ApplyResult{Error: fmt.Errorf("failed to delete key: %w", err)}
+		}
+	case "FREEZE":
+		if err := f.storage.SetFrozenRange(struct {
+			Start string `json:"start"`
+			End   string `json:"end"`
+		}{
+			Start: op.RangeStart,
+			End:   op.RangeEnd,
+		}); err != nil {
+			return &ApplyResult{Error: fmt.Errorf("failed to persist frozen range: %w", err)}
+		}
+	case "UNFREEZE":
+		if err := f.storage.ClearFrozenRange(); err != nil {
+			return &ApplyResult{Error: fmt.Errorf("failed to clear frozen range: %w", err)}
 		}
 	default:
 		return &ApplyResult{Error: fmt.Errorf("unknown operation: %s", op.Op)}

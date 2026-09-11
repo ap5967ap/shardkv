@@ -11,7 +11,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"shardkv/internal/migration"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -36,7 +38,6 @@ var (
 	peersHTTP = flag.String("peers-http", "", "Comma-separated list of peer HTTP addresses, same order as --peers (e.g., 127.0.0.1:8000,127.0.0.1:8001)")
 )
 
-
 type Node struct {
 	nodeID        string
 	shardID       string
@@ -56,6 +57,9 @@ type Node struct {
 	// Populated at bootstrap time so followers can expose the leader's HTTP
 	// address to the router even when they are not the leader.
 	raftToHTTP map[string]string
+	// frozenRanges tracks key ranges that are frozen for migration
+	frozenRanges map[string]migration.Range // key: shardID, value: frozen key range
+	freezeMu     sync.RWMutex
 }
 
 func main() {
@@ -91,7 +95,7 @@ func main() {
 		log.Fatalf("Failed to create node: %v", err)
 	}
 	defer node.Shutdown()
-	
+
 	// Bootstrap if requested
 	if *bootstrap {
 		if *peers != "" {
@@ -142,7 +146,6 @@ func main() {
 	<-signalCh
 	log.Println("Shutting down node...")
 }
-
 
 func NewNode(nodeID, shardID, raftAddr, httpAddr, dataDir string, raftToHTTP map[string]string) (*Node, error) {
 	// Create storage
@@ -203,7 +206,7 @@ func NewNode(nodeID, shardID, raftAddr, httpAddr, dataDir string, raftToHTTP map
 	}
 	raftToHTTP[raftAddr] = httpAddr
 
-	return &Node{
+	node := &Node{
 		nodeID:        nodeID,
 		shardID:       shardID,
 		raftAddr:      raftAddr,
@@ -217,9 +220,17 @@ func NewNode(nodeID, shardID, raftAddr, httpAddr, dataDir string, raftToHTTP map
 		stableStore:   stableStore,
 		snapshotStore: snapshotStore,
 		raftToHTTP:    raftToHTTP,
-	}, nil
-}
+		frozenRanges:  make(map[string]migration.Range),
+	}
 
+	if savedRange, found, err := store.GetFrozenRange(); err != nil {
+		return nil, fmt.Errorf("failed to load persisted frozen range: %w", err)
+	} else if found {
+		node.frozenRanges[node.shardID] = savedRange
+	}
+
+	return node, nil
+}
 
 // StartHTTPServer starts the HTTP API server
 func (n *Node) StartHTTPServer() error {
@@ -228,6 +239,10 @@ func (n *Node) StartHTTPServer() error {
 	mux := http.NewServeMux()
 	n.apiServer.RegisterRoutes(mux)
 	mux.Handle("/metrics", promhttp.Handler())
+
+	// Register admin endpoints for migration
+	mux.HandleFunc("/admin/freeze", n.handleAdminFreeze)
+	mux.HandleFunc("/admin/scan", n.handleAdminScan)
 
 	n.httpSrv = &http.Server{
 		Addr:    n.httpAddr,
@@ -365,6 +380,15 @@ func (n *Node) Shutdown() {
 
 // ApplyOperation applies a Raft operation
 func (n *Node) ApplyOperation(op raftfsm.Operation) error {
+	// CRITICAL: Check if key is frozen for migration BEFORE applying to Raft.
+	// This prevents the race condition from §8.1 where a write can sneak in during
+	// the freeze window and be applied after the copy step.
+	if op.Op == "PUT" || op.Op == "DELETE" {
+		if n.IsKeyFrozen(op.Key) {
+			return fmt.Errorf("key is frozen for migration")
+		}
+	}
+
 	data, err := json.Marshal(op)
 	if err != nil {
 		return fmt.Errorf("failed to marshal operation: %w", err)
@@ -414,6 +438,67 @@ func (n *Node) LeaderHTTPAddr() string {
 	return ""
 }
 
+// IsKeyFrozen checks if a key is in a frozen range for this shard
+func (n *Node) IsKeyFrozen(key string) bool {
+	n.freezeMu.RLock()
+	frozenRange, exists := n.frozenRanges[n.shardID]
+	n.freezeMu.RUnlock()
+	if !exists {
+		if persisted, found, err := n.storage.GetFrozenRange(); err == nil && found {
+			n.freezeMu.Lock()
+			n.frozenRanges[n.shardID] = persisted
+			n.freezeMu.Unlock()
+			frozenRange = persisted
+			exists = true
+		}
+	}
+	if !exists {
+		return false
+	}
+
+	// Check if key falls within the frozen range
+	if frozenRange.Start != "" && key < frozenRange.Start {
+		return false
+	}
+	if frozenRange.End != "" && key > frozenRange.End {
+		return false
+	}
+
+	return true
+}
+
+// FreezeRange freezes a key range for migration and records the state via Raft
+// so the freeze survives leader changes and restarts.
+func (n *Node) FreezeRange(keyRange migration.Range) error {
+	n.freezeMu.Lock()
+	defer n.freezeMu.Unlock()
+
+	op := raftfsm.Operation{
+		Op:        "FREEZE",
+		RangeStart: keyRange.Start,
+		RangeEnd:   keyRange.End,
+	}
+	if err := n.ApplyOperation(op); err != nil {
+		return fmt.Errorf("freeze apply failed: %w", err)
+	}
+
+	n.frozenRanges[n.shardID] = keyRange
+	return nil
+}
+
+// UnfreezeRange removes the freeze state for this shard.
+func (n *Node) UnfreezeRange(keyRange migration.Range) error {
+	n.freezeMu.Lock()
+	defer n.freezeMu.Unlock()
+
+	op := raftfsm.Operation{Op: "UNFREEZE"}
+	if err := n.ApplyOperation(op); err != nil {
+		return fmt.Errorf("unfreeze apply failed: %w", err)
+	}
+
+	delete(n.frozenRanges, n.shardID)
+	return nil
+}
 
 func (n *Node) Get(key string) (string, uint64, error) {
 	return n.storage.Get(key)
@@ -460,4 +545,95 @@ func (n *Node) collectMetricsPeriodically() {
 
 	for range ticker.C {
 	}
+}
+
+// handleAdminFreeze handles freeze/unfreeze requests for migration
+func (n *Node) handleAdminFreeze(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ShardID  string          `json:"shard_id"`
+		KeyRange migration.Range `json:"key_range"`
+		Action   string          `json:"action"` // "freeze" or "unfreeze"
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Only the leader can handle freeze/unfreeze requests
+	if !n.IsLeader() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "not leader",
+		})
+		return
+	}
+
+	// Verify shard ID matches this node's shard
+	if req.ShardID != n.shardID {
+		http.Error(w, "shard ID mismatch", http.StatusBadRequest)
+		return
+	}
+
+	switch req.Action {
+	case "freeze":
+		if err := n.FreezeRange(req.KeyRange); err != nil {
+			http.Error(w, fmt.Sprintf("freeze failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		if err := n.raft.Barrier(5 * time.Second).Error(); err != nil {
+			http.Error(w, fmt.Sprintf("freeze barrier failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "frozen",
+		})
+	case "unfreeze":
+		if err := n.UnfreezeRange(req.KeyRange); err != nil {
+			http.Error(w, fmt.Sprintf("unfreeze failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		if err := n.raft.Barrier(5 * time.Second).Error(); err != nil {
+			http.Error(w, fmt.Sprintf("unfreeze barrier failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "unfrozen",
+		})
+	default:
+		http.Error(w, "invalid action, must be 'freeze' or 'unfreeze'", http.StatusBadRequest)
+	}
+}
+
+// handleAdminScan handles scan requests for migration
+func (n *Node) handleAdminScan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	start := r.URL.Query().Get("start")
+	end := r.URL.Query().Get("end")
+
+	results, err := n.storage.ScanRange(start, end)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("scan failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"keys": results,
+	})
 }
